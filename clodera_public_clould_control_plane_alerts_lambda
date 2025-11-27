@@ -1,0 +1,220 @@
+import subprocess
+import json
+import requests
+import boto3
+import os
+
+# ====== MS Teams Webhook URL from SSM ======
+ssm_client = boto3.client('ssm', region_name='us-east-1')
+webhook_url_parameter_name = "/test/teams_webhook_url_control_plane_alerts"
+TEAMS_WEBHOOK_URL = ssm_client.get_parameter(Name=webhook_url_parameter_name)['Parameter']['Value']
+
+# ====== CDP CLI Path and PYTHONPATH ======
+cdpcli_module_path = "/opt/python/lib/python3.10/site-packages"
+os.environ["PYTHONPATH"] = cdpcli_module_path + ":" + os.environ.get("PYTHONPATH", "")
+cdp = "/opt/python/bin/cdp"
+
+# ====== Fetch Credentials from SSM ======
+def get_credentials_from_ssm():
+    ssm = boto3.client("ssm")
+    param_names = [
+        "/cdp/alerting_user",       # replace the Cloudera control plane alerts user by SSM parameter
+        "/cdp/cdp_access_key_id",   # replace the Cloudera control plane access keys by SSM parameter
+        "/cdp/cdp_private_key"      # replace the Cloudera control plane private keys by SSM parameter
+    ]
+    creds = {}
+    try:
+        for name in param_names:
+            response = ssm.get_parameter(Name=name, WithDecryption=True)
+            if name.endswith("alerting_machine_user"):
+                creds["user"] = response["Parameter"]["Value"]
+            elif name.endswith("access_key_id"):
+                creds["access_key_id"] = response["Parameter"]["Value"]
+            elif name.endswith("private_key"):
+                creds["private_key"] = response["Parameter"]["Value"]
+        return creds
+    except Exception as e:
+        print(f"Error fetching credentials from SSM: {e}")
+        return {}
+
+# ====== Set CDP Credentials from SSM ======
+creds = get_credentials_from_ssm()
+if creds:
+    os.environ["CDP_ACCESS_KEY_ID"] = creds.get("access_key_id", "")
+    os.environ["CDP_PRIVATE_KEY"] = creds.get("private_key", "")
+
+# ====== CDP CLI Wrapper ======
+def run_cdp(command):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, env=os.environ.copy())
+        if result.returncode != 0:
+            return {"error": result.stderr.strip()}
+        return json.loads(result.stdout)
+    except Exception as e:
+        return {"error": str(e)}
+
+# ====== Event Helpers ======
+def get_latest_event(events):
+    return sorted(events, key=lambda e: e.get("eventTimestamp", ""), reverse=True)[0] if events else {}
+
+def format_event(event):
+    return f'{event.get("eventTimestamp", "Unknown")} - {event.get("eventMessage", "No message")}'
+
+# ====== FreeIPA Status ======
+def get_freeipa_status(env_name):
+    status_resp = run_cdp([cdp, "environments", "get-freeipa-status", "--environment-name", env_name])
+    if "error" in status_resp:
+        return "", "Error", status_resp["error"]
+    status = status_resp.get("status", "UNKNOWN")
+    instances = status_resp.get("instances", {})
+    problem_nodes = []
+    for host, data in instances.items():
+        node_status = data.get("status", "UNKNOWN")
+        issues = data.get("issues", [])
+        if node_status not in ["CREATED", "AVAILABLE"] or issues:
+            issue_text = f" ({', '.join(issues)})" if issues else ""
+            problem_nodes.append(f"{host}: {node_status}{issue_text}")
+    reason = "; ".join(problem_nodes) if problem_nodes else "N/A"
+    return "" if status == "AVAILABLE" and not problem_nodes else "", status, reason
+
+# ====== Datalake Status ======
+def get_datalake_status(datalake_name):
+    status_resp = run_cdp([cdp, "datalake", "describe-datalake", "--datalake-name", datalake_name])
+    if "error" in status_resp:
+        return "", "Error", status_resp["error"]
+    datalake = status_resp.get("datalake", {})
+    status = datalake.get("status", "UNKNOWN")
+    instance_groups = datalake.get("instanceGroups", [])
+    issues = []
+    if status not in ["RUNNING", "AVAILABLE"]:
+        host_resp = run_cdp([cdp, "datalake", "get-cluster-host-status", "--cluster-name", datalake_name])
+        service_resp = run_cdp([cdp, "datalake", "get-cluster-service-status", "--cluster-name", datalake_name])
+        for host in host_resp.get("hosts", []):
+            if host.get("healthSummary") != "GOOD":
+                issues.append(f"Host {host.get('hostname', 'unknown-host')} health is {host['healthSummary']}")
+        for service in service_resp.get("services", []):
+            if service.get("healthSummary") != "GOOD":
+                service_type = service.get("type", "unknown")
+                bad_checks = [chk.get("name") for chk in service.get("healthChecks", []) if chk.get("summary") != "GOOD"]
+                if bad_checks:
+                    issues.append(f"Service {service_type} is unhealthy: {', '.join(bad_checks)} is BAD")
+        return "", status, "\n".join(issues) if issues else f"Datalake status is {status}"
+    unhealthy_instances = []
+    for group in instance_groups:
+        group_name = group.get("name", "UnknownGroup")
+        for instance in group.get("instances", []):
+            fqdn = instance.get("discoveryFQDN", "unknown-host")
+            service_status = instance.get("instanceStatus", "UNKNOWN")
+            reason = instance.get("statusReason", "No reason")
+            if service_status != "SERVICES_HEALTHY":
+                unhealthy_instances.append(f"{fqdn} ({group_name}): {service_status} - {reason}")
+    return "", status, "; ".join(unhealthy_instances) if unhealthy_instances else "N/A"
+
+# ====== DataHub Status ======
+def get_datahub_status(cluster_name):
+    desc = run_cdp([cdp, "datahub", "describe-cluster", "--cluster-name", cluster_name])
+    if "error" in desc:
+        return "", "Error", desc["error"]
+
+    status = desc.get("cluster", {}).get("status", "UNKNOWN")
+
+    if status not in ["AVAILABLE", "RUNNING"]:
+        events_resp = run_cdp([cdp, "datahub", "list-cluster-lifecycle-events", "--cluster", cluster_name])
+
+        if "error" in events_resp:
+            return "", status, "N/A"
+
+        events = events_resp.get("clusterEvents", []) or events_resp.get("events", []) or []
+        latest_event = get_latest_event(events)
+        reason = "N/A" if not latest_event else format_event(latest_event)
+        return "", status, reason
+
+    return "", status, "N/A"
+
+# ====== Format Component ======
+def format_component(name, status, reason):
+    return f"{name}\nStatus: {status}\nReason: {reason if reason else 'N/A'}\n\n"
+
+# ====== Build Teams Message ======
+def build_message():
+    envs = run_cdp([cdp, "environments", "list-environments"])
+    dls = run_cdp([cdp, "datalake", "list-datalakes"])
+    dl_map = {dl["environmentCrn"]: dl["datalakeName"] for dl in dls.get("datalakes", [])} if dls else {}
+    message = ""
+    issues_found = False
+
+    for env in envs.get("environments", []):
+        env_name = env["environmentName"]
+        env_crn = env["crn"]
+        datalake_name = dl_map.get(env_crn, "N/A")
+        dh_resp = run_cdp([cdp, "datahub", "list-clusters", "--environment-name", env_name])
+        cluster_names = [dh.get("clusterName") for dh in dh_resp.get("clusters", [])]
+
+        for dh_name in cluster_names:
+            _, ipa_status, ipa_reason = get_freeipa_status(env_name)
+            _, dl_status, dl_reason = get_datalake_status(datalake_name) if datalake_name != "N/A" else ("", "N/A", "Not Configured")
+            _, dh_status, dh_reason = get_datahub_status(dh_name)
+
+            if any(issue not in ["AVAILABLE", "RUNNING", "N/A"] for issue in [ipa_status, dl_status, dh_status]) \
+               or any(keyword in reason.upper() for reason in [ipa_reason, dl_reason, dh_reason]
+                      for keyword in ["ERROR", "BAD", "UNHEALTHY", "FAILED", "STOPPED", "NODE_FAILURE", "UPDATE_IN_PROGRESS"]):
+                issues_found = True
+                message += (
+                    f"**CDP Health Summary:**\n"
+                    f" Environment: {env_name}\n" +
+                    format_component("FreeIPA", ipa_status, ipa_reason) +
+                    format_component("Datalake", dl_status, dl_reason) +
+                    format_component("DataHub", dh_status, dh_reason) +
+                    f"{'-'*60}\n"
+                )
+
+    return message if issues_found else None
+
+# ====== Send to Teams ======
+def send_teams_alert(message):
+    payload = {
+        "type": "message",
+        "attachments": [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.5",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": message,
+                            "wrap": True,
+                            "size": "Medium",
+                            "fontType": "Monospace"
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    try:
+        response = requests.post(TEAMS_WEBHOOK_URL, json=payload)
+        if response.status_code not in [200, 202]:
+            print(f"Failed to send alert: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Exception while sending alert: {e}")
+
+# ====== Lambda Handler ======
+def lambda_handler(event, context):
+    message = build_message()
+    if message:
+        send_teams_alert(message)
+        print("Teams alert sent successfully.")
+    else:
+        print("All components are healthy. No alert sent.")
+    return {"statusCode": 200, "body": "Script executed successfully"}
+
+# ====== Local Execution ======
+if __name__ == "__main__":
+    message = build_message()
+    if message:
+        send_teams_alert(message)
+    else:
+        print("All components are healthy. No alert sent.")
